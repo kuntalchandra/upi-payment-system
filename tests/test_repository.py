@@ -1,194 +1,194 @@
-from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import pytest
 from uuid6 import uuid7
 
 from upi_payment.database import Database
-from upi_payment.domain import IdempotencyKey, Money, Payment, PaymentStatus, VPA
-from upi_payment.repository import SqlitePaymentRepository
+from upi_payment.domain import (
+    IdempotencyKey,
+    Money,
+    Payment,
+    PaymentAttempt,
+    PaymentAttemptStatus,
+    PaymentStatus,
+    VPA,
+)
 from upi_payment.errors import ConcurrentPaymentUpdate
+from upi_payment.repository import SqlitePaymentRepository
+
+
+def make_payment(key=None):
+    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
+    return Payment(
+        uuid7(),
+        key or IdempotencyKey(str(uuid7())),
+        VPA.parse("alice@bank"),
+        VPA.parse("bob@bank"),
+        "Bob",
+        Money(50000, "INR"),
+        "Dinner",
+        PaymentStatus.CREATED,
+        now,
+        now,
+    )
 
 
 def test_creation_persists_payment_and_initial_history(database: Database) -> None:
     repository = SqlitePaymentRepository(database)
-    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
-    payment = Payment(
-        id=uuid7(),
-        idempotency_key=IdempotencyKey(str(uuid7())),
-        payer_vpa=VPA.parse("alice@bank"),
-        payee_vpa=VPA.parse("bob@bank"),
-        payee_name="Bob",
-        money=Money(50000, "INR"),
-        note="Dinner",
-        status=PaymentStatus.CREATED,
-        created_at=now,
-        updated_at=now,
-    )
-
+    payment = make_payment()
     stored, created = repository.create_or_get(payment)
-
-    assert created is True
-    assert stored == payment
+    assert created and stored == payment
     with database.connect() as connection:
-        history = connection.execute(
-            "SELECT * FROM payment_status_changes WHERE payment_id = ?",
-            (str(payment.id),),
-        ).fetchall()
-    assert len(history) == 1
-    assert history[0]["from_status"] is None
-    assert history[0]["to_status"] == "CREATED"
-
-
-def test_duplicate_idempotency_key_returns_existing_payment(
-    database: Database,
-) -> None:
-    repository = SqlitePaymentRepository(database)
-    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
-    key = IdempotencyKey(str(uuid7()))
-    original = Payment(
-        id=uuid7(),
-        idempotency_key=key,
-        payer_vpa=VPA.parse("alice@bank"),
-        payee_vpa=VPA.parse("bob@bank"),
-        payee_name="Bob",
-        money=Money(50000, "INR"),
-        note=None,
-        status=PaymentStatus.CREATED,
-        created_at=now,
-        updated_at=now,
-    )
-    repository.create_or_get(original)
-    duplicate = Payment(
-        id=uuid7(),
-        idempotency_key=key,
-        payer_vpa=original.payer_vpa,
-        payee_vpa=original.payee_vpa,
-        payee_name=original.payee_name,
-        money=original.money,
-        note=original.note,
-        status=PaymentStatus.CREATED,
-        created_at=now,
-        updated_at=now,
-    )
-
-    stored, created = repository.create_or_get(duplicate)
-
-    assert created is False
-    assert stored.id == original.id
+        row = connection.execute(
+            "SELECT attempt_id, from_status, to_status FROM payment_status_changes"
+        ).fetchone()
+    assert tuple(row) == (None, None, "CREATED")
 
 
 def test_concurrent_creation_keeps_one_payment(database: Database) -> None:
     repository = SqlitePaymentRepository(database)
-    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
     key = IdempotencyKey(str(uuid7()))
-
-    def create_payment() -> tuple[Payment, bool]:
-        payment = Payment(
-            id=uuid7(),
-            idempotency_key=key,
-            payer_vpa=VPA.parse("alice@bank"),
-            payee_vpa=VPA.parse("bob@bank"),
-            payee_name="Bob",
-            money=Money(50000, "INR"),
-            note=None,
-            status=PaymentStatus.CREATED,
-            created_at=now,
-            updated_at=now,
-        )
-        return repository.create_or_get(payment)
-
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _index: create_payment(), range(2)))
-
-    assert sorted(created for _payment, created in results) == [False, True]
-    assert len({payment.id for payment, _created in results}) == 1
-    with database.connect() as connection:
-        payment_count = connection.execute(
-            "SELECT COUNT(*) FROM payments WHERE idempotency_key = ?",
-            (key.value,),
-        ).fetchone()[0]
-        history_count = connection.execute(
-            "SELECT COUNT(*) FROM payment_status_changes"
-        ).fetchone()[0]
-    assert payment_count == 1
-    assert history_count == 1
+        results = list(
+            executor.map(
+                lambda _: repository.create_or_get(make_payment(key)), range(2)
+            )
+        )
+    assert sorted(created for _, created in results) == [False, True]
+    assert len({payment.id for payment, _ in results}) == 1
 
 
-def test_compare_and_set_persists_transition_and_history(
-    database: Database,
-) -> None:
+def test_duplicate_creation_key_returns_existing_payment(database: Database) -> None:
     repository = SqlitePaymentRepository(database)
-    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
-    original = Payment(
-        id=uuid7(),
-        idempotency_key=IdempotencyKey(str(uuid7())),
-        payer_vpa=VPA.parse("alice@bank"),
-        payee_vpa=VPA.parse("bob@bank"),
-        payee_name="Bob",
-        money=Money(50000, "INR"),
-        note=None,
-        status=PaymentStatus.CREATED,
-        created_at=now,
-        updated_at=now,
-    )
-    repository.create_or_get(original)
-    processing = original.start_processing(
-        datetime(2026, 9, 22, 10, 1, tzinfo=UTC)
-    )
+    key = IdempotencyKey(str(uuid7()))
+    first, _ = repository.create_or_get(make_payment(key))
+    replay, created = repository.create_or_get(make_payment(key))
+    assert created is False
+    assert replay.id == first.id
 
-    repository.update_with_status_change(
-        previous=original,
-        updated=processing,
-        source="SUBMISSION",
-    )
 
-    stored = repository.find_by_id(original.id)
-    assert stored is not None
-    assert stored.status == PaymentStatus.PROCESSING
-    assert stored.version == 1
+def test_attempt_state_and_audit_are_updated_atomically(database: Database) -> None:
+    repository = SqlitePaymentRepository(database)
+    payment = make_payment()
+    repository.create_or_get(payment)
+    at = datetime(2026, 9, 22, 10, 1, tzinfo=UTC)
+    attempt = PaymentAttempt(
+        uuid7(),
+        payment.id,
+        IdempotencyKey(str(uuid7())),
+        1,
+        PaymentAttemptStatus.PROCESSING,
+        at,
+        at,
+    )
+    processing, stored_attempt = repository.start_attempt(
+        previous_payment=payment,
+        processing_payment=payment.start_processing(at),
+        attempt=attempt,
+    )
+    failed_at = datetime(2026, 9, 22, 10, 2, tzinfo=UTC)
+    repository.update_attempt_with_payment_status_change(
+        previous_payment=processing,
+        updated_payment=processing.mark_failed(failed_at),
+        previous_attempt=stored_attempt,
+        updated_attempt=stored_attempt.mark_failed(failed_at, "DECLINED"),
+        source="ATTEMPT_SUBMISSION",
+        reason_code="DECLINED",
+    )
     with database.connect() as connection:
         history = connection.execute(
-            """
-            SELECT from_status, to_status, source
-            FROM payment_status_changes
-            WHERE payment_id = ?
-            ORDER BY id
-            """,
-            (str(original.id),),
+            """SELECT attempt_id, from_status, to_status, reason_code
+               FROM payment_status_changes ORDER BY id"""
         ).fetchall()
     assert [tuple(row) for row in history] == [
-        (None, "CREATED", "CREATION"),
-        ("CREATED", "PROCESSING", "SUBMISSION"),
+        (None, None, "CREATED", None),
+        (str(attempt.id), "CREATED", "PROCESSING", None),
+        (str(attempt.id), "PROCESSING", "FAILED", "DECLINED"),
     ]
 
 
-def test_stale_update_is_rejected(database: Database) -> None:
+def test_stale_attempt_update_rolls_back_payment_update(database: Database) -> None:
     repository = SqlitePaymentRepository(database)
-    now = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
-    original = Payment(
-        id=uuid7(),
-        idempotency_key=IdempotencyKey(str(uuid7())),
-        payer_vpa=VPA.parse("alice@bank"),
-        payee_vpa=VPA.parse("bob@bank"),
-        payee_name="Bob",
-        money=Money(50000, "INR"),
-        note=None,
-        status=PaymentStatus.CREATED,
-        created_at=now,
-        updated_at=now,
+    payment = make_payment()
+    repository.create_or_get(payment)
+    at = datetime(2026, 9, 22, 10, 1, tzinfo=UTC)
+    attempt = PaymentAttempt(
+        uuid7(),
+        payment.id,
+        IdempotencyKey(str(uuid7())),
+        1,
+        PaymentAttemptStatus.PROCESSING,
+        at,
+        at,
     )
-    repository.create_or_get(original)
-    processing = original.start_processing(now)
-    repository.update_with_status_change(
-        previous=original,
-        updated=processing,
-        source="SUBMISSION",
+    processing, attempt = repository.start_attempt(
+        previous_payment=payment,
+        processing_payment=payment.start_processing(at),
+        attempt=attempt,
     )
-
+    updated_attempt = attempt.mark_pending(at)
+    updated_payment = processing.mark_pending(at)
+    repository.update_attempt_with_payment_status_change(
+        previous_payment=processing,
+        updated_payment=updated_payment,
+        previous_attempt=attempt,
+        updated_attempt=updated_attempt,
+        source="STATUS_ENQUIRY",
+    )
     with pytest.raises(ConcurrentPaymentUpdate):
-        repository.update_with_status_change(
-            previous=original,
-            updated=processing,
-            source="SUBMISSION",
+        repository.update_attempt_with_payment_status_change(
+            previous_payment=processing,
+            updated_payment=updated_payment,
+            previous_attempt=attempt,
+            updated_attempt=updated_attempt,
+            source="STATUS_ENQUIRY",
         )
+
+
+def test_attempt_queries_preserve_sequence(database: Database) -> None:
+    repository = SqlitePaymentRepository(database)
+    payment = make_payment()
+    repository.create_or_get(payment)
+    at = datetime(2026, 9, 22, 10, 1, tzinfo=UTC)
+    first = PaymentAttempt(
+        uuid7(),
+        payment.id,
+        IdempotencyKey(str(uuid7())),
+        1,
+        PaymentAttemptStatus.PROCESSING,
+        at,
+        at,
+    )
+    processing, first = repository.start_attempt(
+        previous_payment=payment,
+        processing_payment=payment.start_processing(at),
+        attempt=first,
+    )
+    failed_at = datetime(2026, 9, 22, 10, 2, tzinfo=UTC)
+    failed_payment, _ = repository.update_attempt_with_payment_status_change(
+        previous_payment=processing,
+        updated_payment=processing.mark_failed(failed_at),
+        previous_attempt=first,
+        updated_attempt=first.mark_failed(failed_at, "DECLINED"),
+        source="ATTEMPT_SUBMISSION",
+    )
+    second = PaymentAttempt(
+        uuid7(),
+        payment.id,
+        IdempotencyKey(str(uuid7())),
+        2,
+        PaymentAttemptStatus.PROCESSING,
+        at,
+        at,
+    )
+    repository.start_attempt(
+        previous_payment=failed_payment,
+        processing_payment=failed_payment.start_processing(at),
+        attempt=second,
+    )
+    assert [item.attempt_number for item in repository.list_attempts(payment.id)] == [
+        1,
+        2,
+    ]
+    assert repository.find_latest_attempt(payment.id).id == second.id

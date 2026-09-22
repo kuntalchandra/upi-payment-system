@@ -11,20 +11,23 @@ from upi_payment.domain import (
     IdempotencyKey,
     Money,
     Payment,
+    PaymentAttempt,
+    PaymentAttemptStatus,
     PaymentStatus,
     VPA,
 )
 from upi_payment.errors import (
+    ConcurrentPaymentUpdate,
     IdempotencyConflict,
     InvalidAmount,
     InvalidIdempotencyKey,
-    InvalidVPA,
     InvalidPaymentState,
+    InvalidVPA,
+    PaymentAttemptNotFound,
     PaymentAuthorizationFailed,
     PaymentNotFound,
     PayeeNotFound,
     SamePayerAndPayee,
-    ConcurrentPaymentUpdate,
 )
 from upi_payment.ports import (
     AuthorizationVerifier,
@@ -52,6 +55,12 @@ class CreatePaymentResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class CreatePaymentAttemptResult:
+    attempt: PaymentAttempt
+    created: bool
+
+
 class PaymentService:
     def __init__(
         self,
@@ -69,138 +78,163 @@ class PaymentService:
         self._clock = clock
 
     def create_payment(self, command: CreatePaymentCommand) -> CreatePaymentResult:
-        idempotency_key = self._parse_idempotency_key(command.idempotency_key)
-        payer_vpa = self._parse_vpa(command.payer_vpa)
-        payee_vpa = self._parse_vpa(command.payee_vpa)
+        key = self._parse_idempotency_key(command.idempotency_key)
+        payer = self._parse_vpa(command.payer_vpa)
+        payee = self._parse_vpa(command.payee_vpa)
         money = self._parse_money(command.amount_minor, command.currency)
         note = command.note.strip() if command.note and command.note.strip() else None
-
-        if payer_vpa == payee_vpa:
+        if payer == payee:
             raise SamePayerAndPayee("Payer and payee VPA must differ")
-
-        existing = self._repository.find_by_idempotency_key(idempotency_key)
-        if existing is not None:
-            self._verify_same_request(existing, payer_vpa, payee_vpa, money, note)
-            return CreatePaymentResult(existing, created=False)
-
-        resolved_payee = self._resolver.resolve(payee_vpa)
-        if resolved_payee is None:
+        existing = self._repository.find_by_idempotency_key(key)
+        if existing:
+            self._verify_same_request(existing, payer, payee, money, note)
+            return CreatePaymentResult(existing, False)
+        resolved = self._resolver.resolve(payee)
+        if resolved is None:
             raise PayeeNotFound("Payee VPA could not be resolved")
-
         now = self._clock()
         proposed = Payment(
-            id=uuid7(),
-            idempotency_key=idempotency_key,
-            payer_vpa=payer_vpa,
-            payee_vpa=resolved_payee.vpa,
-            payee_name=resolved_payee.display_name,
-            money=money,
-            note=note,
-            status=PaymentStatus.CREATED,
-            created_at=now,
-            updated_at=now,
+            uuid7(),
+            key,
+            payer,
+            resolved.vpa,
+            resolved.display_name,
+            money,
+            note,
+            PaymentStatus.CREATED,
+            now,
+            now,
         )
         stored, created = self._repository.create_or_get(proposed)
-        self._verify_same_request(stored, payer_vpa, payee_vpa, money, note)
+        self._verify_same_request(stored, payer, payee, money, note)
         return CreatePaymentResult(stored, created)
 
     def get_payment(self, payment_id: str) -> Payment:
         return self._find_payment(payment_id)
 
-    def submit_payment(self, payment_id: str, authorization_token: str) -> Payment:
+    def get_latest_payment_attempt(self, payment_id: str) -> PaymentAttempt | None:
         payment = self._find_payment(payment_id)
+        return self._repository.find_latest_attempt(payment.id)
 
+    def create_payment_attempt(
+        self, payment_id: str, idempotency_key: str, authorization_token: str
+    ) -> CreatePaymentAttemptResult:
+        payment = self._find_payment(payment_id)
+        key = self._parse_idempotency_key(idempotency_key)
+        existing = self._repository.find_attempt_by_idempotency_key(payment.id, key)
+        if existing:
+            return CreatePaymentAttemptResult(existing, False)
         if payment.status in {
-            PaymentStatus.SUCCEEDED,
-            PaymentStatus.FAILED,
+            PaymentStatus.PROCESSING,
             PaymentStatus.PENDING,
+            PaymentStatus.SUCCEEDED,
         }:
-            return payment
-
-        if payment.status == PaymentStatus.PROCESSING:
-            return self._recover_processing(payment)
-
+            raise InvalidPaymentState(
+                f"Cannot create an attempt for payment in {payment.status.value}"
+            )
         if not self._authorization_verifier.verify(authorization_token):
             raise PaymentAuthorizationFailed("Payment authorisation was rejected")
-
-        processing = payment.start_processing(self._clock())
+        now = self._clock()
+        processing = payment.start_processing(now)
+        attempt = PaymentAttempt(
+            uuid7(),
+            payment.id,
+            key,
+            self._repository.next_attempt_number(payment.id),
+            PaymentAttemptStatus.PROCESSING,
+            now,
+            now,
+        )
         try:
-            processing = self._repository.update_with_status_change(
-                previous=payment,
-                updated=processing,
-                source="SUBMISSION",
+            processing, attempt = self._repository.start_attempt(
+                previous_payment=payment,
+                processing_payment=processing,
+                attempt=attempt,
             )
-        except ConcurrentPaymentUpdate:
-            return self._find_payment(payment_id)
-
-        result = self._gateway.submit(processing.id, processing)
-        return self._apply_gateway_result(processing, result, source="SUBMISSION")
-
-    def refresh_status(self, payment_id: str) -> Payment:
-        payment = self._find_payment(payment_id)
-        if payment.status == PaymentStatus.PROCESSING:
-            return self._recover_processing(payment)
-        if payment.status != PaymentStatus.PENDING:
+        except ConcurrentPaymentUpdate as exc:
+            existing = self._repository.find_attempt_by_idempotency_key(payment.id, key)
+            if existing:
+                return CreatePaymentAttemptResult(existing, False)
             raise InvalidPaymentState(
-                f"Cannot refresh payment in {payment.status.value}"
-            )
-
-        result = self._gateway.get_status(payment.id)
-        if result is None or result.outcome == GatewayOutcome.PENDING:
-            return payment
-        return self._apply_gateway_result(
-            payment, result, source="STATUS_ENQUIRY"
+                "Another payment attempt is already active"
+            ) from exc
+        result = self._gateway.submit(attempt.id, processing)
+        return CreatePaymentAttemptResult(
+            self._apply_gateway_result(
+                processing, attempt, result, source="ATTEMPT_SUBMISSION"
+            ),
+            True,
         )
 
-    def _recover_processing(self, payment: Payment) -> Payment:
-        result = self._gateway.get_status(payment.id)
-        if result is None:
-            result = self._gateway.submit(payment.id, payment)
+    def get_payment_attempt(self, payment_id: str, attempt_id: str) -> PaymentAttempt:
+        payment = self._find_payment(payment_id)
+        return self._find_attempt(payment.id, attempt_id)
+
+    def list_payment_attempts(self, payment_id: str) -> list[PaymentAttempt]:
+        return self._repository.list_attempts(self._find_payment(payment_id).id)
+
+    def refresh_payment_attempt(
+        self, payment_id: str, attempt_id: str
+    ) -> PaymentAttempt:
+        payment = self._find_payment(payment_id)
+        attempt = self._find_attempt(payment.id, attempt_id)
+        if attempt.status in {
+            PaymentAttemptStatus.SUCCEEDED,
+            PaymentAttemptStatus.FAILED,
+        }:
+            return attempt
+        result = self._gateway.get_status(attempt.id)
+        if attempt.status == PaymentAttemptStatus.PROCESSING:
+            if result is None:
+                result = self._gateway.submit(attempt.id, payment)
+        elif result is None or result.outcome == GatewayOutcome.PENDING:
+            return attempt
         return self._apply_gateway_result(
-            payment, result, source="STATUS_ENQUIRY"
+            payment, attempt, result, source="STATUS_ENQUIRY"
         )
 
     def _apply_gateway_result(
         self,
         payment: Payment,
+        attempt: PaymentAttempt,
         result: GatewayResult,
         *,
         source: str,
-    ) -> Payment:
+    ) -> PaymentAttempt:
+        now = self._clock()
         if result.outcome == GatewayOutcome.PENDING:
-            if payment.status == PaymentStatus.PENDING:
-                return payment
-            updated = payment.mark_pending(
-                self._clock(), result.network_reference
-            )
+            if attempt.status == PaymentAttemptStatus.PENDING:
+                return attempt
+            updated_attempt = attempt.mark_pending(now, result.network_reference)
+            updated_payment = payment.mark_pending(now)
         elif result.outcome == GatewayOutcome.SUCCEEDED:
             if result.network_reference is None:
                 raise ValueError("Successful gateway result requires a reference")
-            updated = payment.mark_succeeded(
-                self._clock(), result.network_reference
-            )
+            updated_attempt = attempt.mark_succeeded(now, result.network_reference)
+            updated_payment = payment.mark_succeeded(now)
         else:
             if result.failure_code is None:
                 raise ValueError("Failed gateway result requires a failure code")
-            updated = payment.mark_failed(
-                self._clock(),
-                result.failure_code,
-                result.network_reference,
+            updated_attempt = attempt.mark_failed(
+                now, result.failure_code, result.network_reference
             )
-
+            updated_payment = payment.mark_failed(now)
         try:
-            return self._repository.update_with_status_change(
-                previous=payment,
-                updated=updated,
+            _, stored = self._repository.update_attempt_with_payment_status_change(
+                previous_payment=payment,
+                updated_payment=updated_payment,
+                previous_attempt=attempt,
+                updated_attempt=updated_attempt,
                 source=source,
                 reason_code=result.failure_code,
             )
+            return stored
         except ConcurrentPaymentUpdate:
-            return self._find_payment(str(payment.id))
+            return self._find_attempt(payment.id, str(attempt.id))
 
-    def _find_payment(self, raw_payment_id: str) -> Payment:
+    def _find_payment(self, raw_id: str) -> Payment:
         try:
-            payment_id = UUID(raw_payment_id)
+            payment_id = UUID(raw_id)
         except (ValueError, AttributeError) as exc:
             raise PaymentNotFound("Payment was not found") from exc
         payment = self._repository.find_by_id(payment_id)
@@ -208,40 +242,43 @@ class PaymentService:
             raise PaymentNotFound("Payment was not found")
         return payment
 
-    @staticmethod
-    def _parse_idempotency_key(raw_value: str) -> IdempotencyKey:
+    def _find_attempt(self, payment_id: UUID, raw_id: str) -> PaymentAttempt:
         try:
-            return IdempotencyKey.parse(raw_value)
+            attempt_id = UUID(raw_id)
+        except (ValueError, AttributeError) as exc:
+            raise PaymentAttemptNotFound("Payment attempt was not found") from exc
+        attempt = self._repository.find_attempt_by_id(payment_id, attempt_id)
+        if attempt is None:
+            raise PaymentAttemptNotFound("Payment attempt was not found")
+        return attempt
+
+    @staticmethod
+    def _parse_idempotency_key(value: str) -> IdempotencyKey:
+        try:
+            return IdempotencyKey.parse(value)
         except ValueError as exc:
             raise InvalidIdempotencyKey(str(exc)) from exc
 
     @staticmethod
-    def _parse_vpa(raw_value: str) -> VPA:
+    def _parse_vpa(value: str) -> VPA:
         try:
-            return VPA.parse(raw_value)
+            return VPA.parse(value)
         except ValueError as exc:
             raise InvalidVPA(str(exc)) from exc
 
     @staticmethod
-    def _parse_money(amount_minor: int, currency: str) -> Money:
+    def _parse_money(amount: int, currency: str) -> Money:
         try:
-            return Money(amount_minor, currency)
+            return Money(amount, currency)
         except ValueError as exc:
             raise InvalidAmount(str(exc)) from exc
 
     @staticmethod
     def _verify_same_request(
-        payment: Payment,
-        payer_vpa: VPA,
-        payee_vpa: VPA,
-        money: Money,
-        note: str | None,
+        payment: Payment, payer: VPA, payee: VPA, money: Money, note: str | None
     ) -> None:
         if not payment.has_same_creation_request(
-            payer_vpa=payer_vpa,
-            payee_vpa=payee_vpa,
-            money=money,
-            note=note,
+            payer_vpa=payer, payee_vpa=payee, money=money, note=note
         ):
             raise IdempotencyConflict(
                 "Idempotency key was already used with a different request"

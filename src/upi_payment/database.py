@@ -23,8 +23,7 @@ class Database:
 
     def initialise(self) -> None:
         with self.connect() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS payments (
                     id TEXT PRIMARY KEY,
                     idempotency_key TEXT NOT NULL UNIQUE,
@@ -45,44 +44,68 @@ class Database:
                     ),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    version INTEGER NOT NULL CHECK (version >= 0),
+                    version INTEGER NOT NULL CHECK (version >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS payment_attempts (
+                    id TEXT PRIMARY KEY,
+                    payment_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('PROCESSING', 'PENDING', 'SUCCEEDED', 'FAILED')
+                    ),
                     network_reference TEXT,
                     failure_code TEXT,
-                    submitted_at TEXT,
-                    completed_at TEXT
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    version INTEGER NOT NULL CHECK (version >= 0),
+                    FOREIGN KEY (payment_id) REFERENCES payments(id),
+                    UNIQUE (payment_id, idempotency_key),
+                    UNIQUE (payment_id, attempt_number)
                 );
 
                 CREATE TABLE IF NOT EXISTS payment_status_changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     payment_id TEXT NOT NULL,
+                    attempt_id TEXT,
                     from_status TEXT,
                     to_status TEXT NOT NULL,
                     source TEXT NOT NULL,
                     reason_code TEXT,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY (payment_id) REFERENCES payments(id)
+                    FOREIGN KEY (payment_id) REFERENCES payments(id),
+                    FOREIGN KEY (attempt_id) REFERENCES payment_attempts(id)
                 );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_attempts_one_active
+                ON payment_attempts(payment_id)
+                WHERE status IN ('PROCESSING', 'PENDING');
+
+                CREATE INDEX IF NOT EXISTS ix_payment_attempts_payment_number
+                ON payment_attempts(payment_id, attempt_number);
 
                 CREATE INDEX IF NOT EXISTS ix_payment_status_changes_payment_time
                 ON payment_status_changes(payment_id, created_at);
-                """
-            )
-            self._add_missing_payment_columns(connection)
+                """)
+            self._add_missing_status_change_columns(connection)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS ix_payment_status_changes_attempt_time
+                ON payment_status_changes(attempt_id, created_at)
+                """)
 
     @staticmethod
-    def _add_missing_payment_columns(connection: sqlite3.Connection) -> None:
+    def _add_missing_status_change_columns(
+        connection: sqlite3.Connection,
+    ) -> None:
         existing = {
             row["name"]
-            for row in connection.execute("PRAGMA table_info(payments)").fetchall()
+            for row in connection.execute(
+                "PRAGMA table_info(payment_status_changes)"
+            ).fetchall()
         }
-        additions = {
-            "network_reference": "TEXT",
-            "failure_code": "TEXT",
-            "submitted_at": "TEXT",
-            "completed_at": "TEXT",
-        }
-        for name, column_type in additions.items():
-            if name not in existing:
-                connection.execute(
-                    f"ALTER TABLE payments ADD COLUMN {name} {column_type}"
-                )
+        if "attempt_id" not in existing:
+            connection.execute(
+                "ALTER TABLE payment_status_changes ADD COLUMN attempt_id TEXT"
+            )

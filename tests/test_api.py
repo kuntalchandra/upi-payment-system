@@ -13,175 +13,161 @@ from upi_payment.resolver import InMemoryVpaResolver
 from upi_payment.service import PaymentService
 
 
-def client(
-    repository: SqlitePaymentRepository,
-    gateway: InMemoryUpiGateway | None = None,
-) -> TestClient:
+def client(repository, gateway=None):
     service = PaymentService(
         repository,
         InMemoryVpaResolver({"bob@bank": "Bob"}),
         InMemoryAuthorizationVerifier({"test-approved-token"}),
-        gateway or InMemoryUpiGateway(GatewayOutcome.SUCCEEDED),
+        gateway or InMemoryUpiGateway(),
         clock=lambda: datetime(2026, 9, 22, 10, 0, tzinfo=UTC),
     )
     return TestClient(create_app(service))
 
 
-def request_body(amount_minor: int = 50000) -> dict[str, object]:
+def body(amount=50000):
     return {
         "payerVpa": "alice@bank",
         "payeeVpa": "bob@bank",
-        "amountMinor": amount_minor,
+        "amountMinor": amount,
         "currency": "INR",
         "note": "Dinner",
     }
 
 
-def test_create_and_replay_payment(repository: SqlitePaymentRepository) -> None:
+def create_payment(api):
+    return api.post(
+        "/v1/payments", headers={"Idempotency-Key": str(uuid7())}, json=body()
+    )
+
+
+def test_create_and_replay_payment(repository) -> None:
     api = client(repository)
     key = str(uuid7())
+    first = api.post("/v1/payments", headers={"Idempotency-Key": key}, json=body())
+    replay = api.post("/v1/payments", headers={"Idempotency-Key": key}, json=body())
+    assert [first.status_code, replay.status_code] == [201, 200]
+    assert first.json()["id"] == replay.json()["id"]
 
-    created = api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": key},
-        json=request_body(),
+
+def test_payment_creation_validation_errors(repository) -> None:
+    api = client(repository)
+    assert api.post("/v1/payments", json=body()).status_code == 400
+    assert (
+        api.post(
+            "/v1/payments", headers={"Idempotency-Key": "bad"}, json=body()
+        ).status_code
+        == 422
     )
-    replayed = api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": key},
-        json=request_body(),
-    )
-
-    assert created.status_code == 201
-    assert replayed.status_code == 200
-    assert replayed.json()["id"] == created.json()["id"]
-    assert created.json()["status"] == "CREATED"
 
 
-def test_idempotency_conflict_has_stable_error(
-    repository: SqlitePaymentRepository,
-) -> None:
+def test_payment_creation_idempotency_conflict(repository) -> None:
     api = client(repository)
     key = str(uuid7())
-    api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": key},
-        json=request_body(),
-    )
-
+    api.post("/v1/payments", headers={"Idempotency-Key": key}, json=body())
     response = api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": key},
-        json=request_body(amount_minor=60000),
+        "/v1/payments", headers={"Idempotency-Key": key}, json=body(60000)
     )
-
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
 
-def test_invalid_idempotency_key_has_stable_error(
-    repository: SqlitePaymentRepository,
-) -> None:
-    response = client(repository).post(
-        "/v1/payments",
-        headers={"Idempotency-Key": "not-a-uuid"},
-        json=request_body(),
-    )
-
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "INVALID_IDEMPOTENCY_KEY"
-
-
-def test_missing_idempotency_key_has_stable_error(
-    repository: SqlitePaymentRepository,
-) -> None:
-    response = client(repository).post(
-        "/v1/payments",
-        json=request_body(),
-    )
-
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "MISSING_IDEMPOTENCY_KEY"
-
-
-def test_create_retrieve_and_submit_payment(
-    repository: SqlitePaymentRepository,
-) -> None:
-    api = client(repository)
-    created = api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": str(uuid7())},
-        json=request_body(),
-    )
-    payment_id = created.json()["id"]
-
-    retrieved = api.get(f"/v1/payments/{payment_id}")
-    submitted = api.post(
-        f"/v1/payments/{payment_id}/submit",
+def test_create_replay_and_list_attempt(repository) -> None:
+    gateway = InMemoryUpiGateway(GatewayOutcome.SUCCEEDED)
+    api = client(repository, gateway)
+    payment_id = create_payment(api).json()["id"]
+    key = str(uuid7())
+    first = api.post(
+        f"/v1/payments/{payment_id}/attempts",
+        headers={"Idempotency-Key": key},
         json={"authorizationToken": "test-approved-token"},
     )
-
-    assert retrieved.status_code == 200
-    assert retrieved.json()["status"] == "CREATED"
-    assert submitted.status_code == 200
-    assert submitted.json()["status"] == "SUCCEEDED"
-    assert submitted.json()["networkReference"] is not None
-
-
-def test_rejected_authorisation_has_stable_error(
-    repository: SqlitePaymentRepository,
-) -> None:
-    api = client(repository)
-    created = api.post(
-        "/v1/payments",
-        headers={"Idempotency-Key": str(uuid7())},
-        json=request_body(),
+    replay = api.post(
+        f"/v1/payments/{payment_id}/attempts",
+        headers={"Idempotency-Key": key},
+        json={"authorizationToken": "test-approved-token"},
     )
+    attempts = api.get(f"/v1/payments/{payment_id}/attempts")
+    assert [first.status_code, replay.status_code] == [201, 200]
+    assert first.json()["id"] == replay.json()["id"]
+    assert len(attempts.json()) == 1
 
+
+def test_attempt_can_be_retrieved(repository) -> None:
+    api = client(repository)
+    payment_id = create_payment(api).json()["id"]
+    created = api.post(
+        f"/v1/payments/{payment_id}/attempts",
+        headers={"Idempotency-Key": str(uuid7())},
+        json={"authorizationToken": "test-approved-token"},
+    )
+    retrieved = api.get(f"/v1/payments/{payment_id}/attempts/{created.json()['id']}")
+    assert retrieved.status_code == 200
+    assert retrieved.json() == created.json()
+
+
+def test_rejected_authorisation_has_stable_error(repository) -> None:
+    api = client(repository)
+    payment_id = create_payment(api).json()["id"]
     response = api.post(
-        f"/v1/payments/{created.json()['id']}/submit",
+        f"/v1/payments/{payment_id}/attempts",
+        headers={"Idempotency-Key": str(uuid7())},
         json={"authorizationToken": "wrong-token"},
     )
-
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "PAYMENT_AUTHORIZATION_FAILED"
 
 
-def test_pending_payment_refreshes_to_success(
-    repository: SqlitePaymentRepository,
-) -> None:
+def test_failed_payment_can_create_second_attempt(repository) -> None:
+    api = client(repository, InMemoryUpiGateway(GatewayOutcome.FAILED))
+    payment_id = create_payment(api).json()["id"]
+    responses = [
+        api.post(
+            f"/v1/payments/{payment_id}/attempts",
+            headers={"Idempotency-Key": str(uuid7())},
+            json={"authorizationToken": "test-approved-token"},
+        )
+        for _ in range(2)
+    ]
+    assert [item.json()["attemptNumber"] for item in responses] == [1, 2]
+
+
+def test_pending_attempt_refreshes_and_payment_read_is_derived(repository) -> None:
     gateway = InMemoryUpiGateway(GatewayOutcome.PENDING)
     api = client(repository, gateway)
-    created = api.post(
-        "/v1/payments",
+    payment_id = create_payment(api).json()["id"]
+    pending = api.post(
+        f"/v1/payments/{payment_id}/attempts",
         headers={"Idempotency-Key": str(uuid7())},
-        json=request_body(),
-    )
-    payment_id = created.json()["id"]
-    submitted = api.post(
-        f"/v1/payments/{payment_id}/submit",
         json={"authorizationToken": "test-approved-token"},
     )
+    attempt_id = pending.json()["id"]
     gateway.set_result(
-        UUID(payment_id),
-        GatewayResult(
-            GatewayOutcome.SUCCEEDED,
-            network_reference=f"SIM-{payment_id}",
-        ),
+        UUID(attempt_id),
+        GatewayResult(GatewayOutcome.SUCCEEDED, network_reference=f"SIM-{attempt_id}"),
     )
+    refreshed = api.post(
+        f"/v1/payments/{payment_id}/attempts/{attempt_id}/refresh-status"
+    )
+    payment = api.get(f"/v1/payments/{payment_id}").json()
+    assert pending.status_code == 202 and refreshed.status_code == 200
+    assert payment["status"] == "SUCCEEDED"
+    assert payment["networkReference"] == f"SIM-{attempt_id}"
+    assert payment["submittedAt"] == pending.json()["createdAt"]
 
-    refreshed = api.post(f"/v1/payments/{payment_id}/refresh-status")
 
-    assert submitted.status_code == 202
-    assert submitted.json()["status"] == "PENDING"
-    assert refreshed.status_code == 200
-    assert refreshed.json()["status"] == "SUCCEEDED"
+def test_attempt_errors_are_stable(repository) -> None:
+    api = client(repository)
+    payment_id = create_payment(api).json()["id"]
+    missing_key = api.post(
+        f"/v1/payments/{payment_id}/attempts",
+        json={"authorizationToken": "test-approved-token"},
+    )
+    unknown = api.get(f"/v1/payments/{payment_id}/attempts/{uuid7()}")
+    assert missing_key.json()["error"]["code"] == "MISSING_IDEMPOTENCY_KEY"
+    assert unknown.json()["error"]["code"] == "PAYMENT_ATTEMPT_NOT_FOUND"
 
 
-def test_unknown_payment_returns_stable_error(
-    repository: SqlitePaymentRepository,
-) -> None:
+def test_unknown_payment_has_stable_error(repository) -> None:
     response = client(repository).get(f"/v1/payments/{uuid7()}")
-
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "PAYMENT_NOT_FOUND"

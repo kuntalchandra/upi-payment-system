@@ -20,6 +20,8 @@ The first version supports one payer-initiated P2P push payment:
 8. Retrieve the current payment status.
 9. Resolve an unresolved outcome through simulated status enquiry.
 10. Prevent duplicate payment creation and duplicate effective submission.
+11. Preserve each intentional execution as a separately identifiable payment attempt.
+12. Permit another intentional attempt after a definitive failure.
 
 Payer and payee VPAs are payment inputs. User onboarding, bank accounts and linked-VPA management are not part of this system.
 
@@ -53,13 +55,14 @@ Revisit only after the basic lifecycle is complete:
 CREATED
     → PROCESSING
         → SUCCEEDED
-        → FAILED
         → PENDING
               → SUCCEEDED
               → FAILED
+        → FAILED
+              → PROCESSING (new attempt)
 ```
 
-`SUCCEEDED` and `FAILED` are terminal. Authorisation is a prerequisite for submission, not a persisted payment state.
+`SUCCEEDED` is terminal for a payment. `FAILED` permits a new intentional attempt. Each attempt independently ends in `SUCCEEDED` or `FAILED`. Authorisation is a prerequisite for an attempt, not a persisted payment state.
 
 ## 6. Confirmed invariants
 
@@ -67,11 +70,14 @@ CREATED
 2. Repeating the same creation request must not create another logical payment.
 3. One logical payment must not cause multiple effective transfers.
 4. A timeout or missing response is not automatically a failed payment.
-5. A terminal payment cannot return to a non-terminal state.
+5. A succeeded payment cannot return to a non-terminal state; a failed payment may start a new attempt.
 6. The raw UPI PIN must never enter the API, persistence or logs.
 7. Money is represented in integer paise, never floating-point rupees.
 8. Every accepted state transition must be traceable.
 9. A local database transaction cannot atomically include the external gateway call.
+10. At most one attempt may be `PROCESSING` or `PENDING` for a payment.
+11. Recovery must reuse the same attempt ID; it must not create another attempt.
+12. Every attempt-related audit transition must carry its attempt ID.
 
 ## 7. Design principles
 
@@ -149,6 +155,17 @@ CREATED
 
 **Gate:** definition of done is satisfied.
 
+### Phase 6 — Payment attempts
+
+- Separate payment intent from downstream execution attempts.
+- Add attempt-scoped idempotency, lifecycle, recovery and history.
+- Permit a new attempt after definitive failure while preventing concurrent active attempts.
+- Derive payment execution details from the latest attempt.
+
+**Deliverable:** complete multi-attempt lifecycle with attempt-correlated audit history.
+
+**Gate:** entity, API, schema, recovery, tests and documentation agree.
+
 ## 10. Decision log
 
 | Decision | Status | Reason |
@@ -166,8 +183,8 @@ CREATED
 | Use `CREATED`, `PROCESSING`, `PENDING`, `SUCCEEDED`, and `FAILED` | Confirmed | Distinguishes local creation, active submission, uncertain outcome, and terminal outcomes |
 | Do not persist a separate `AUTHORIZED` state | Confirmed | Authorisation is a submission precondition in this scope |
 | Use a client-generated UUIDv7 idempotency key | Confirmed | Stable across retries and time-orderable without encoding mutable payment data |
-| Use the server-generated `payment_id` as the downstream transaction reference | Confirmed | Provides stable correlation without introducing another identifier |
-| Make simulated gateway submission idempotent by `payment_id` | Confirmed | Allows safe recovery across external-call crash windows |
+| Use server-generated `payment_attempt_id` as the downstream transaction reference | Confirmed | Distinguishes intentional attempts while making recovery of each attempt idempotent |
+| Make simulated gateway submission idempotent by `payment_attempt_id` | Confirmed | Retries one execution safely without preventing a later intentional attempt |
 | Recover `PROCESSING` through status lookup, then same-reference resubmission only if not found | Confirmed | Handles crashes before and after gateway acceptance |
 | Keep `PENDING` recovery status-enquiry only | Confirmed | Gateway has already acknowledged the transaction |
 | Use Python's `sqlite3` directly for the initial repository | Confirmed | Keeps persistence and transaction behaviour visible without an ORM |
@@ -176,6 +193,10 @@ CREATED
 | Use an injected authorisation verifier | Confirmed | Keeps the opaque token outside domain state and persistence |
 | Use an in-memory gateway keyed by `payment_id` | Confirmed | Provides deterministic, idempotent external behaviour for learning and tests |
 | Use optimistic compare-and-set for status changes | Confirmed | Prevents competing requests from applying the same transition |
+| Model `PaymentAttempt` as a child entity of `Payment` | Confirmed | It has stable identity, lifecycle and gateway behaviour but cannot exist independently of its payment |
+| Retain `PaymentStatusChange` as an immutable audit record | Confirmed | Preserves transition history and supports future operational analytics |
+| Correlate attempt transitions through `attempt_id` | Confirmed | Allows analytics to group payment history by execution attempt |
+| Keep attempt-specific data out of `Payment` | Confirmed | Avoids duplicated authoritative state; payment reads derive it from the latest attempt |
 
 ## 11. Progress tracker
 
@@ -186,6 +207,7 @@ CREATED
 | Phase 3 — Payment creation | Completed | Creation API and 17 tests passing |
 | Phase 4 — Submission and status resolution | Completed | Complete lifecycle and 32 tests passing |
 | Phase 5 — Consolidation and documentation | Completed | Clean setup, 33 tests and live HTTP flow verified |
+| Phase 6 — Payment attempts | Completed | Attempt lifecycle, retry, recovery, audit correlation and derived reads verified |
 
 ## 12. Definition of done
 

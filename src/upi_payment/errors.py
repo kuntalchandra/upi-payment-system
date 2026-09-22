@@ -34,6 +34,10 @@ class PaymentNotFound(PaymentError):
     code = "PAYMENT_NOT_FOUND"
 
 
+class PaymentAttemptNotFound(PaymentError):
+    code = "PAYMENT_ATTEMPT_NOT_FOUND"
+
+
 class InvalidPaymentState(PaymentError):
     code = "INVALID_PAYMENT_STATE"
 
