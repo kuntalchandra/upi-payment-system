@@ -54,40 +54,94 @@ CREATED
               → FAILED
 ```
 
-## Current domain model
+## Entities and schemas
 
-### Payment
+### Domain entity
 
-`Payment` is the aggregate root. The current implementation stores:
+#### Payment
 
-- server-generated UUIDv7 identity;
-- client idempotency key;
-- payer and payee VPAs;
-- resolved payee name;
-- immutable money and optional note;
-- current status;
-- creation and update times;
-- concurrent-update version.
+`Payment` is the only domain entity and the aggregate root. It has a stable identity, owns the payment lifecycle and protects its state transitions.
 
-The payment ID is also the downstream transaction reference. Submission adds the network reference, failure code, submitted time and completed time when applicable.
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `id` | UUIDv7 | Server-generated aggregate identity and downstream idempotency reference |
+| `idempotency_key` | `IdempotencyKey` | Identifies one client creation intent |
+| `payer_vpa` | `VPA` | Normalised payer address snapshot |
+| `payee_vpa` | `VPA` | Normalised payee address snapshot |
+| `payee_name` | string | Display name captured when the payee is resolved |
+| `money` | `Money` | Immutable amount and currency |
+| `note` | string or null | Optional payment note |
+| `status` | `PaymentStatus` | Current lifecycle state |
+| `created_at` | UTC datetime | Creation time |
+| `updated_at` | UTC datetime | Last accepted state-change time |
+| `version` | integer | Optimistic-concurrency version |
+| `network_reference` | string or null | Reference returned by the gateway |
+| `failure_code` | string or null | Definitive gateway failure reason |
+| `submitted_at` | UTC datetime or null | First downstream-submission time |
+| `completed_at` | UTC datetime or null | Definitive success or failure time |
+
+Payer, payee, bank account and gateway are not modelled as local entities. This service stores only the payment data it owns or needs as a snapshot.
 
 ### Value objects
 
-- **VPA:** normalised `local-part@handle` value with structural validation.
-- **Money:** positive integer `amount_minor`, restricted to `INR`.
-- **IdempotencyKey:** client-generated UUIDv7 reused for every retry of one logical creation request.
+Value objects have no independent identity or lifecycle. They are compared by value and validated when constructed.
 
-### Payment status history
+| Value object | Fields | Invariant |
+| --- | --- | --- |
+| `VPA` | `value` | Normalised lowercase `local-part@handle` with structural validation |
+| `Money` | `amount_minor`, `currency` | Positive integer amount in paise; currency is `INR` |
+| `IdempotencyKey` | `value` | Client-generated UUIDv7 reused for every retry of one creation intent |
 
-Every created payment receives one append-only transition row:
+`PaymentStatus` is the lifecycle enum: `CREATED`, `PROCESSING`, `PENDING`, `SUCCEEDED` or `FAILED`.
 
-```text
-NULL → CREATED, source = CREATION
-```
+### Persisted audit record
 
-The payment insert and history insert share one SQLite transaction.
+#### PaymentStatusChange
 
-Every later accepted transition appends another row atomically with the payment update.
+`payment_status_changes` is an append-only persistence record, not another aggregate. Its database row identity supports ordering and audit, while all transition decisions remain inside `Payment` and `PaymentService`.
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `id` | integer | Database-generated row identity |
+| `payment_id` | UUID | Owning payment |
+| `from_status` | status or null | Previous status; null for creation |
+| `to_status` | status | Accepted new status |
+| `source` | string | Component or operation that caused the transition |
+| `reason_code` | string or null | Optional failure or transition reason |
+| `created_at` | UTC datetime | Transition time |
+
+Creation records `NULL → CREATED` with source `CREATION`. The payment write and its history write share one SQLite transaction; every later accepted transition updates the payment and appends its history row atomically.
+
+### Derived and read models
+
+Derived models present existing facts and do not own an independent lifecycle.
+
+| Model | Derived from | Use |
+| --- | --- | --- |
+| `PaymentResponse` | `Payment` | API representation returned by create, retrieve, submit and refresh operations |
+
+There is deliberately no stored `PaymentReceipt` entity. For a successful payment, `PaymentResponse` already exposes the receipt-like facts: payment ID, parties, amount, status, timestamps and network reference. A distinct receipt should be introduced only if future requirements give it an independent issuance, numbering, legal or retention lifecycle.
+
+### Transport and application schemas
+
+These structures move data across layers; they are not domain entities.
+
+| Schema | Layer | Purpose |
+| --- | --- | --- |
+| `CreatePaymentRequest` | API | Parses the JSON creation body |
+| `SubmitPaymentRequest` | API | Carries the opaque simulated authorisation token |
+| `CreatePaymentCommand` | Application | Carries validated creation input into the service |
+| `CreatePaymentResult` | Application | Returns the payment plus replay information to the API |
+
+### Integration contract types
+
+| Type | Produced by | Purpose |
+| --- | --- | --- |
+| `ResolvedVPA` | `VpaResolver` | Verified VPA and display name returned by payee resolution |
+| `GatewayResult` | `UpiGateway` | Gateway outcome, network reference and optional failure code |
+| `GatewayOutcome` | `UpiGateway` | Enumerates `SUCCEEDED`, `FAILED` and `PENDING`; a missing enquiry result is represented by `None` |
+
+The dependency boundaries are expressed by the `PaymentRepository`, `VpaResolver`, `AuthorizationVerifier` and `UpiGateway` protocols. Implementations are replaceable infrastructure, not entities.
 
 ## Identity and idempotency
 
