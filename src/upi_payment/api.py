@@ -11,8 +11,11 @@ from upi_payment.errors import (
     IdempotencyConflict,
     InvalidAmount,
     InvalidIdempotencyKey,
+    InvalidPaymentState,
     InvalidVPA,
     MissingIdempotencyKey,
+    PaymentAuthorizationFailed,
+    PaymentNotFound,
     PayeeNotFound,
     PaymentError,
     SamePayerAndPayee,
@@ -42,6 +45,16 @@ class PaymentResponse(BaseModel):
     note: str | None
     status: str
     created_at: datetime = Field(alias="createdAt")
+    network_reference: str | None = Field(alias="networkReference")
+    failure_code: str | None = Field(alias="failureCode")
+    submitted_at: datetime | None = Field(alias="submittedAt")
+    completed_at: datetime | None = Field(alias="completedAt")
+
+
+class SubmitPaymentRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    authorization_token: str = Field(alias="authorizationToken")
 
 
 def create_app(payment_service: PaymentService) -> FastAPI:
@@ -78,21 +91,48 @@ def create_app(payment_service: PaymentService) -> FastAPI:
                 note=body.note,
             )
         )
-        payment = result.payment
-        response = PaymentResponse(
-            id=payment.id,
-            payerVpa=payment.payer_vpa.value,
-            payeeVpa=payment.payee_vpa.value,
-            payeeName=payment.payee_name,
-            amountMinor=payment.money.amount_minor,
-            currency=payment.money.currency,
-            note=payment.note,
-            status=payment.status.value,
-            createdAt=payment.created_at,
-        )
         return JSONResponse(
             status_code=201 if result.created else 200,
-            content=response.model_dump(mode="json", by_alias=True),
+            content=_payment_response(result.payment),
+        )
+
+    @app.get(
+        "/v1/payments/{payment_id}",
+        response_model=PaymentResponse,
+        response_model_by_alias=True,
+    )
+    def get_payment(payment_id: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=200,
+            content=_payment_response(payment_service.get_payment(payment_id)),
+        )
+
+    @app.post(
+        "/v1/payments/{payment_id}/submit",
+        response_model=PaymentResponse,
+        response_model_by_alias=True,
+    )
+    def submit_payment(
+        payment_id: str, body: SubmitPaymentRequest
+    ) -> JSONResponse:
+        payment = payment_service.submit_payment(
+            payment_id, body.authorization_token
+        )
+        return JSONResponse(
+            status_code=202 if payment.status.value in {"PROCESSING", "PENDING"} else 200,
+            content=_payment_response(payment),
+        )
+
+    @app.post(
+        "/v1/payments/{payment_id}/refresh-status",
+        response_model=PaymentResponse,
+        response_model_by_alias=True,
+    )
+    def refresh_status(payment_id: str) -> JSONResponse:
+        payment = payment_service.refresh_status(payment_id)
+        return JSONResponse(
+            status_code=202 if payment.status.value in {"PROCESSING", "PENDING"} else 200,
+            content=_payment_response(payment),
         )
 
     return app
@@ -103,6 +143,12 @@ def _status_code_for(error: PaymentError) -> int:
         return 400
     if isinstance(error, IdempotencyConflict):
         return 409
+    if isinstance(error, InvalidPaymentState):
+        return 409
+    if isinstance(error, PaymentNotFound):
+        return 404
+    if isinstance(error, PaymentAuthorizationFailed):
+        return 403
     if isinstance(error, SamePayerAndPayee):
         return 422
     if isinstance(error, (InvalidVPA, InvalidAmount, InvalidIdempotencyKey)):
@@ -110,3 +156,22 @@ def _status_code_for(error: PaymentError) -> int:
     if isinstance(error, PayeeNotFound):
         return 422
     return 400
+
+
+def _payment_response(payment) -> dict[str, object]:
+    response = PaymentResponse(
+        id=payment.id,
+        payerVpa=payment.payer_vpa.value,
+        payeeVpa=payment.payee_vpa.value,
+        payeeName=payment.payee_name,
+        amountMinor=payment.money.amount_minor,
+        currency=payment.money.currency,
+        note=payment.note,
+        status=payment.status.value,
+        createdAt=payment.created_at,
+        networkReference=payment.network_reference,
+        failureCode=payment.failure_code,
+        submittedAt=payment.submitted_at,
+        completedAt=payment.completed_at,
+    )
+    return response.model_dump(mode="json", by_alias=True)

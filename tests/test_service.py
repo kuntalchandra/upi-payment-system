@@ -4,6 +4,9 @@ import pytest
 from uuid6 import uuid7
 
 from upi_payment.errors import IdempotencyConflict, PayeeNotFound
+from upi_payment.authorization import InMemoryAuthorizationVerifier
+from upi_payment.gateway import InMemoryUpiGateway
+from upi_payment.ports import GatewayOutcome
 from upi_payment.repository import SqlitePaymentRepository
 from upi_payment.resolver import InMemoryVpaResolver
 from upi_payment.service import CreatePaymentCommand, PaymentService
@@ -24,6 +27,8 @@ def service(repository: SqlitePaymentRepository) -> PaymentService:
     return PaymentService(
         repository,
         InMemoryVpaResolver({"bob@bank": "Bob"}),
+        InMemoryAuthorizationVerifier({"test-approved-token"}),
+        InMemoryUpiGateway(GatewayOutcome.SUCCEEDED),
         clock=lambda: datetime(2026, 9, 22, 10, 0, tzinfo=UTC),
     )
 
@@ -68,4 +73,3 @@ def test_unresolved_payee_is_rejected(
 
     with pytest.raises(PayeeNotFound):
         payment_service.create_payment(missing_payee)
-

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from uuid import UUID
 
 from upi_payment.database import Database
@@ -11,6 +12,7 @@ from upi_payment.domain import (
     PaymentStatus,
     VPA,
 )
+from upi_payment.errors import ConcurrentPaymentUpdate
 
 
 class SqlitePaymentRepository:
@@ -77,6 +79,71 @@ class SqlitePaymentRepository:
                     raise
                 return self._to_payment(row), False
 
+    def find_by_id(self, payment_id: UUID) -> Payment | None:
+        with self._database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM payments WHERE id = ?",
+                (str(payment_id),),
+            ).fetchone()
+        return self._to_payment(row) if row is not None else None
+
+    def update_with_status_change(
+        self,
+        *,
+        previous: Payment,
+        updated: Payment,
+        source: str,
+        reason_code: str | None = None,
+    ) -> Payment:
+        with self._database.connect() as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE payments
+                    SET status = ?,
+                        network_reference = ?,
+                        failure_code = ?,
+                        submitted_at = ?,
+                        completed_at = ?,
+                        updated_at = ?,
+                        version = ?
+                    WHERE id = ? AND version = ? AND status = ?
+                    """,
+                    (
+                        updated.status.value,
+                        updated.network_reference,
+                        updated.failure_code,
+                        self._datetime_value(updated.submitted_at),
+                        self._datetime_value(updated.completed_at),
+                        updated.updated_at.isoformat(),
+                        updated.version,
+                        str(previous.id),
+                        previous.version,
+                        previous.status.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ConcurrentPaymentUpdate(
+                        "Payment was updated by another request"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO payment_status_changes (
+                        payment_id, from_status, to_status, source,
+                        reason_code, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(previous.id),
+                        previous.status.value,
+                        updated.status.value,
+                        source,
+                        reason_code,
+                        updated.updated_at.isoformat(),
+                    ),
+                )
+        return updated
+
     @staticmethod
     def _to_payment(row: sqlite3.Row) -> Payment:
         from datetime import datetime
@@ -93,5 +160,22 @@ class SqlitePaymentRepository:
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             version=row["version"],
+            network_reference=row["network_reference"],
+            failure_code=row["failure_code"],
+            submitted_at=SqlitePaymentRepository._parse_datetime(
+                row["submitted_at"]
+            ),
+            completed_at=SqlitePaymentRepository._parse_datetime(
+                row["completed_at"]
+            ),
         )
 
+    @staticmethod
+    def _datetime_value(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    @staticmethod
+    def _parse_datetime(value: str | None) -> datetime | None:
+        if value is None:
+            return None
+        return datetime.fromisoformat(value)

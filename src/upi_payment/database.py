@@ -45,7 +45,11 @@ class Database:
                     ),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    version INTEGER NOT NULL CHECK (version >= 0)
+                    version INTEGER NOT NULL CHECK (version >= 0),
+                    network_reference TEXT,
+                    failure_code TEXT,
+                    submitted_at TEXT,
+                    completed_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS payment_status_changes (
@@ -63,4 +67,22 @@ class Database:
                 ON payment_status_changes(payment_id, created_at);
                 """
             )
+            self._add_missing_payment_columns(connection)
 
+    @staticmethod
+    def _add_missing_payment_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(payments)").fetchall()
+        }
+        additions = {
+            "network_reference": "TEXT",
+            "failure_code": "TEXT",
+            "submitted_at": "TEXT",
+            "completed_at": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE payments ADD COLUMN {name} {column_type}"
+                )

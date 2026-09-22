@@ -28,3 +28,19 @@ class SamePayerAndPayee(PaymentError):
 
 class IdempotencyConflict(PaymentError):
     code = "IDEMPOTENCY_CONFLICT"
+
+
+class PaymentNotFound(PaymentError):
+    code = "PAYMENT_NOT_FOUND"
+
+
+class InvalidPaymentState(PaymentError):
+    code = "INVALID_PAYMENT_STATE"
+
+
+class PaymentAuthorizationFailed(PaymentError):
+    code = "PAYMENT_AUTHORIZATION_FAILED"
+
+
+class ConcurrentPaymentUpdate(PaymentError):
+    code = "CONCURRENT_PAYMENT_UPDATE"

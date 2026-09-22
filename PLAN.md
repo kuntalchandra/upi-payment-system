@@ -175,6 +175,9 @@ These will be reviewed and completed in Phase 1:
 | Use Python's `sqlite3` directly for the initial repository | Confirmed | Keeps persistence and transaction behaviour visible without an ORM |
 | Use an injected in-memory VPA resolver initially | Confirmed | Exercises the external resolution boundary without real connectivity |
 | Enforce idempotency with service comparison and a database unique constraint | Confirmed | Handles both ordinary retries and concurrent creation |
+| Use an injected authorisation verifier | Confirmed | Keeps the opaque token outside domain state and persistence |
+| Use an in-memory gateway keyed by `payment_id` | Confirmed | Provides deterministic, idempotent external behaviour for learning and tests |
+| Use optimistic compare-and-set for status changes | Confirmed | Prevents competing requests from applying the same transition |
 
 ## 11. Progress tracker
 
@@ -183,7 +186,7 @@ These will be reviewed and completed in Phase 1:
 | Phase 1 — Requirements, lifecycle and invariants | Completed | Requirements, lifecycle and invariants approved |
 | Phase 2 — Domain model, API and persistence design | Completed | Model, contracts, schema and transaction boundaries approved |
 | Phase 3 — Payment creation | Completed | Creation API and 17 tests passing |
-| Phase 4 — Submission and status resolution | Not started |  |
+| Phase 4 — Submission and status resolution | Completed | Complete lifecycle and 32 tests passing |
 | Phase 5 — Consolidation and documentation | Not started |  |
 
 ## 12. Definition of done

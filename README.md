@@ -4,9 +4,7 @@ A phased Python and FastAPI reference implementation for studying a basic UPI pa
 
 ## Current status
 
-Phase 3 is complete. The repository currently implements idempotent P2P payment creation with SQLite persistence, simulated VPA resolution, stable API errors and tests across the domain, repository, service and API layers.
-
-Payment submission and status resolution remain Phase 4 work.
+Phase 4 is complete. The repository implements the complete basic P2P lifecycle: idempotent creation, retrieval, simulated authorisation, idempotent gateway submission, definitive and pending outcomes, status refresh, crash recovery, transition history and concurrent-update protection.
 
 ## System boundary
 
@@ -27,6 +25,13 @@ It does not reproduce NPCI, a PSP, a bank, or a real payment network.
 7. Returns the existing payment when the same key and payload are replayed.
 8. Rejects the same key with a different payload.
 9. Uses a database uniqueness constraint to protect concurrent creation.
+10. Retrieves the authoritative local payment state.
+11. Verifies an opaque simulated authorisation token without storing it.
+12. Claims a payment through an atomic `CREATED → PROCESSING` transition.
+13. Submits once to an idempotent simulated gateway using `payment_id`.
+14. Records `SUCCEEDED`, `FAILED` or `PENDING`.
+15. Resolves pending payments through status enquiry.
+16. Recovers stuck `PROCESSING` payments by querying first and safely resubmitting only when not found.
 
 The default runtime resolver recognises:
 
@@ -37,15 +42,7 @@ The default runtime resolver recognises:
 
 These entries only support local demonstration and are not a user or bank-account model.
 
-## Current lifecycle
-
-Creation produces:
-
-```text
-CREATED
-```
-
-The complete approved lifecycle will be implemented in Phase 4:
+## Implemented lifecycle
 
 ```text
 CREATED
@@ -61,7 +58,7 @@ CREATED
 
 ### Payment
 
-`Payment` is the aggregate root. Phase 3 stores:
+`Payment` is the aggregate root. The current implementation stores:
 
 - server-generated UUIDv7 identity;
 - client idempotency key;
@@ -72,7 +69,7 @@ CREATED
 - creation and update times;
 - concurrent-update version.
 
-The payment ID will also become the downstream transaction reference in Phase 4.
+The payment ID is also the downstream transaction reference. Submission adds the network reference, failure code, submitted time and completed time when applicable.
 
 ### Value objects
 
@@ -89,6 +86,8 @@ NULL → CREATED, source = CREATION
 ```
 
 The payment insert and history insert share one SQLite transaction.
+
+Every later accepted transition appends another row atomically with the payment update.
 
 ## Identity and idempotency
 
@@ -144,13 +143,52 @@ Successful first response:
   "currency": "INR",
   "note": "Dinner",
   "status": "CREATED",
-  "createdAt": "2026-09-22T10:00:00Z"
+  "createdAt": "2026-09-22T10:00:00Z",
+  "networkReference": null,
+  "failureCode": null,
+  "submittedAt": null,
+  "completedAt": null
 }
 ```
 
 - First creation: `201 Created`.
 - Same key and same payload: `200 OK` with the original payment.
 - Same key and different payload: `409 Conflict`.
+
+### Retrieve payment
+
+```http
+GET /v1/payments/{paymentId}
+```
+
+Returns local authoritative state without contacting the gateway.
+
+### Submit payment
+
+```http
+POST /v1/payments/{paymentId}/submit
+Content-Type: application/json
+```
+
+```json
+{
+  "authorizationToken": "test-approved-token"
+}
+```
+
+- `200 OK` for definitive success or failure.
+- `202 Accepted` for a pending outcome.
+- Repeated submission returns current state and never creates another effective transfer.
+
+### Refresh status
+
+```http
+POST /v1/payments/{paymentId}/refresh-status
+```
+
+- `PENDING`: performs status enquiry only.
+- `PROCESSING`: queries first and resubmits with the same payment ID only when the gateway returns not found.
+- Returns `409 INVALID_PAYMENT_STATE` for states that do not need recovery.
 
 ## Implemented errors
 
@@ -168,7 +206,10 @@ Errors use:
 | HTTP | Code | Meaning |
 | --- | --- | --- |
 | `400` | `MISSING_IDEMPOTENCY_KEY` | Header is absent |
+| `403` | `PAYMENT_AUTHORIZATION_FAILED` | Simulated authorisation is rejected |
+| `404` | `PAYMENT_NOT_FOUND` | Payment ID is unknown |
 | `409` | `IDEMPOTENCY_CONFLICT` | Same key used with a different request |
+| `409` | `INVALID_PAYMENT_STATE` | Operation is invalid from the current state |
 | `422` | `INVALID_IDEMPOTENCY_KEY` | Key is not UUIDv7 |
 | `422` | `INVALID_VPA` | VPA is structurally invalid |
 | `422` | `PAYEE_NOT_FOUND` | Resolver cannot verify the payee |
@@ -203,16 +244,18 @@ HTTP request
     → FastAPI schema and error mapping
     → PaymentService orchestration
     → VPA, Money and IdempotencyKey rules
-    → VpaResolver boundary
+    → VpaResolver / AuthorizationVerifier / UpiGateway boundaries
     → SqlitePaymentRepository
     → SQLite constraints and transaction
 ```
 
 - **API:** transport fields, HTTP statuses and error responses.
-- **Service:** creation order, replay handling and dependency coordination.
-- **Domain:** valid values and payment request equality.
+- **Service:** creation, submission, recovery and dependency coordination.
+- **Domain:** valid values, request equality and state transitions.
 - **Resolver:** external payee lookup boundary.
-- **Repository:** SQL mapping, atomic insert and concurrent idempotency protection.
+- **Authorisation verifier:** opaque-token simulation.
+- **Gateway:** idempotent external submission and status simulation.
+- **Repository:** SQL mapping, atomic state/history writes and compare-and-set updates.
 - **Database:** final relational constraints.
 
 ## Setup
@@ -271,10 +314,10 @@ Full suite:
 python -m pytest
 ```
 
-Phase 3 result:
+Current full-suite result:
 
 ```text
-17 passed
+32 passed
 ```
 
 ## Project structure
@@ -287,9 +330,11 @@ Phase 3 result:
 ├── src/
 │   └── upi_payment/
 │       ├── api.py
+│       ├── authorization.py
 │       ├── database.py
 │       ├── domain.py
 │       ├── errors.py
+│       ├── gateway.py
 │       ├── main.py
 │       ├── ports.py
 │       ├── repository.py
@@ -300,19 +345,13 @@ Phase 3 result:
     ├── test_api.py
     ├── test_domain.py
     ├── test_repository.py
-    └── test_service.py
+    ├── test_service.py
+    └── test_submission.py
 ```
 
-## Phase 4
+## Phase 5
 
-The next phase will implement:
-
-- simulated authorisation;
-- idempotent gateway submission using `payment_id`;
-- `PROCESSING`, `PENDING`, `SUCCEEDED` and `FAILED` transitions;
-- payment retrieval;
-- status refresh and crash recovery;
-- optimistic concurrency checks.
+The final phase will remove any drift, exercise a clean setup and representative full flow, and verify requirements, API contracts, domain state, schema, code, tests, `PLAN.md` and `README.md` agree.
 
 ## Practical future scope
 
