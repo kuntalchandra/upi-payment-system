@@ -172,6 +172,9 @@ These will be reviewed and completed in Phase 1:
 | Make simulated gateway submission idempotent by `payment_id` | Confirmed | Allows safe recovery across external-call crash windows |
 | Recover `PROCESSING` through status lookup, then same-reference resubmission only if not found | Confirmed | Handles crashes before and after gateway acceptance |
 | Keep `PENDING` recovery status-enquiry only | Confirmed | Gateway has already acknowledged the transaction |
+| Use Python's `sqlite3` directly for the initial repository | Confirmed | Keeps persistence and transaction behaviour visible without an ORM |
+| Use an injected in-memory VPA resolver initially | Confirmed | Exercises the external resolution boundary without real connectivity |
+| Enforce idempotency with service comparison and a database unique constraint | Confirmed | Handles both ordinary retries and concurrent creation |
 
 ## 11. Progress tracker
 
@@ -179,7 +182,7 @@ These will be reviewed and completed in Phase 1:
 | --- | --- | --- |
 | Phase 1 — Requirements, lifecycle and invariants | Completed | Requirements, lifecycle and invariants approved |
 | Phase 2 — Domain model, API and persistence design | Completed | Model, contracts, schema and transaction boundaries approved |
-| Phase 3 — Payment creation | Not started | Awaiting repository setup |
+| Phase 3 — Payment creation | Completed | Creation API and 17 tests passing |
 | Phase 4 — Submission and status resolution | Not started |  |
 | Phase 5 — Consolidation and documentation | Not started |  |
 

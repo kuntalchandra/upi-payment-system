@@ -4,40 +4,48 @@ A phased Python and FastAPI reference implementation for studying a basic UPI pa
 
 ## Current status
 
-Phases 1 and 2 are complete. Requirements, lifecycle, domain model, API contracts, persistence design and transaction boundaries are confirmed. Application code begins in Phase 3.
+Phase 3 is complete. The repository currently implements idempotent P2P payment creation with SQLite persistence, simulated VPA resolution, stable API errors and tests across the domain, repository, service and API layers.
+
+Payment submission and status resolution remain Phase 4 work.
 
 ## System boundary
 
-The system represents a simplified payer-facing UPI payment service. It owns the local payment lifecycle and coordinates with simulated external components.
+The system represents a simplified payer-facing UPI payment service. It owns local payment records and coordinates with simulated external components.
 
 It does not reproduce NPCI, a PSP, a bank, or a real payment network.
 
-## Initial scope
+## Implemented behaviour
 
-- Payer-initiated P2P push payment.
-- Payer and payee identified by VPA.
-- Local VPA syntax validation and simulated payee resolution.
-- Separate payment creation and submission.
-- Simulated authorisation without accepting a UPI PIN.
-- Simulated gateway success, failure and pending outcomes.
-- Status retrieval and resolution of uncertain outcomes.
-- Idempotent creation and submission.
-- INR amounts represented in integer paise.
+`POST /v1/payments`:
 
-## Actors and external boundaries
+1. Requires a client-generated UUIDv7 `Idempotency-Key`.
+2. Normalises and structurally validates payer and payee VPAs.
+3. Rejects a payment to the same VPA.
+4. Validates a positive INR amount represented in paise.
+5. Resolves the payee through an injected in-memory resolver.
+6. Atomically stores the payment and initial status-history row.
+7. Returns the existing payment when the same key and payload are replayed.
+8. Rejects the same key with a different payload.
+9. Uses a database uniqueness constraint to protect concurrent creation.
 
-| Actor or component | Responsibility |
+The default runtime resolver recognises:
+
+| VPA | Display name |
 | --- | --- |
-| Payer | Initiates and authorises a payment |
-| Payee | Receives a payment through a VPA |
-| Client application | Calls the service APIs |
-| Payment service | Owns the local payment lifecycle |
-| VPA resolver | Simulates payee verification |
-| UPI gateway | Represents the external payment-network boundary |
+| `alice@bank` | Alice |
+| `bob@bank` | Bob |
 
-Payer and payee are actors, not locally managed user entities.
+These entries only support local demonstration and are not a user or bank-account model.
 
-## Lifecycle
+## Current lifecycle
+
+Creation produces:
+
+```text
+CREATED
+```
+
+The complete approved lifecycle will be implemented in Phase 4:
 
 ```text
 CREATED
@@ -49,52 +57,38 @@ CREATED
               → FAILED
 ```
 
-| State | Meaning |
-| --- | --- |
-| `CREATED` | Valid payment exists; submission has not started |
-| `PROCESSING` | Submission started, but no gateway outcome is durably recorded |
-| `PENDING` | Gateway acknowledged the transaction, but its final outcome is unresolved |
-| `SUCCEEDED` | Transfer is definitively successful |
-| `FAILED` | Transfer is definitively unsuccessful |
-
-`SUCCEEDED` and `FAILED` are terminal. Authorisation is a submission precondition, not a separately persisted state.
-
-## Domain model
+## Current domain model
 
 ### Payment
 
-`Payment` is the aggregate root and represents one logical transfer.
+`Payment` is the aggregate root. Phase 3 stores:
 
-It owns:
+- server-generated UUIDv7 identity;
+- client idempotency key;
+- payer and payee VPAs;
+- resolved payee name;
+- immutable money and optional note;
+- current status;
+- creation and update times;
+- concurrent-update version.
 
-- identity and current status;
-- payer VPA, payee VPA and resolved payee name;
-- immutable amount, currency and optional note;
-- downstream transaction reference;
-- network reference and definitive failure details;
-- lifecycle timestamps and concurrent-update version;
-- valid state transitions and terminal-state protection.
-
-The server-generated `payment_id` is also the transaction reference sent to the simulated gateway.
-
-### PaymentStatusChange
-
-An immutable child record appended for every accepted state transition. It records the payment, previous state, new state, source, optional reason and timestamp.
-
-It is persisted because transition traceability is an invariant. It is not a separate aggregate.
+The payment ID will also become the downstream transaction reference in Phase 4.
 
 ### Value objects
 
 - **VPA:** normalised `local-part@handle` value with structural validation.
-- **Money:** positive integer `amount_minor` with currency fixed to `INR`.
-- **IdempotencyKey:** non-empty client-generated UUIDv7 reused for every retry of one creation request.
+- **Money:** positive integer `amount_minor`, restricted to `INR`.
+- **IdempotencyKey:** client-generated UUIDv7 reused for every retry of one logical creation request.
 
-### Read models
+### Payment status history
 
-- **PaymentView:** current payment representation returned by the APIs.
-- **PaymentReceipt:** successful-payment representation derived from `Payment`; it has no independent lifecycle.
+Every created payment receives one append-only transition row:
 
-A separate `PaymentAttempt` entity is intentionally omitted because the initial scope has one logical gateway submission identified by one stable transaction reference.
+```text
+NULL → CREATED, source = CREATION
+```
+
+The payment insert and history insert share one SQLite transaction.
 
 ## Identity and idempotency
 
@@ -105,26 +99,23 @@ Client idempotency key
 
 Payment ID
     UUIDv7 generated by the server
-    Identifies the Payment entity
-    Used as the downstream transaction reference
-
-Network reference
-    Returned by the simulated gateway
-    Stored when available
+    Identifies the Payment aggregate
 ```
 
-- Same idempotency key and same creation payload return the existing payment.
-- Same key with a different payload returns `IDEMPOTENCY_CONFLICT`.
-- Mutable request fields and time buckets are not encoded into the idempotency key.
-- Repeated gateway submission with the same `payment_id` returns the existing gateway result rather than causing another transfer.
+- Same key and same normalised request return the existing payment.
+- Same key and different payer, payee, money or note return `IDEMPOTENCY_CONFLICT`.
+- The service checks for an ordinary replay before resolving the payee again.
+- The SQLite unique constraint handles concurrent requests that pass the initial lookup together.
+- Mutable request fields and time buckets are not encoded into the key.
 
-## API contracts
+## Implemented API
 
 ### Create payment
 
 ```http
 POST /v1/payments
 Idempotency-Key: <client-generated UUIDv7>
+Content-Type: application/json
 ```
 
 ```json
@@ -137,132 +128,191 @@ Idempotency-Key: <client-generated UUIDv7>
 }
 ```
 
-- First creation: `201 Created`.
-- Same key and same payload: `200 OK` with the existing payment.
-- Same key and different payload: `409 Conflict`.
-
-### Submit payment
+Successful first response:
 
 ```http
-POST /v1/payments/{paymentId}/submit
+201 Created
 ```
 
 ```json
 {
-  "authorizationToken": "simulated-short-lived-token"
+  "id": "0199f2d8-6a31-7b42-9c15-8f7a63d80121",
+  "payerVpa": "alice@bank",
+  "payeeVpa": "bob@bank",
+  "payeeName": "Bob",
+  "amountMinor": 50000,
+  "currency": "INR",
+  "note": "Dinner",
+  "status": "CREATED",
+  "createdAt": "2026-09-22T10:00:00Z"
 }
 ```
 
-The token is never stored or logged.
+- First creation: `201 Created`.
+- Same key and same payload: `200 OK` with the original payment.
+- Same key and different payload: `409 Conflict`.
 
-- Definitive success or failure: `200 OK`.
-- Pending outcome: `202 Accepted`.
-- Repeated submission returns the current payment without creating another effective transfer.
+## Implemented errors
 
-### Retrieve payment
+Errors use:
 
-```http
-GET /v1/payments/{paymentId}
+```json
+{
+  "error": {
+    "code": "IDEMPOTENCY_CONFLICT",
+    "message": "Idempotency key was already used with a different request"
+  }
+}
 ```
-
-Returns local authoritative state without contacting the gateway.
-
-### Refresh status
-
-```http
-POST /v1/payments/{paymentId}/refresh-status
-```
-
-- For `PENDING`, query status only.
-- For a stuck `PROCESSING` payment, query first; resubmit with the same `payment_id` only when the gateway returns `NOT_FOUND`.
-
-## Stable API errors
 
 | HTTP | Code | Meaning |
 | --- | --- | --- |
 | `400` | `MISSING_IDEMPOTENCY_KEY` | Header is absent |
-| `404` | `PAYMENT_NOT_FOUND` | Payment ID is unknown |
 | `409` | `IDEMPOTENCY_CONFLICT` | Same key used with a different request |
-| `409` | `INVALID_PAYMENT_STATE` | Operation is invalid from the current state |
+| `422` | `INVALID_IDEMPOTENCY_KEY` | Key is not UUIDv7 |
 | `422` | `INVALID_VPA` | VPA is structurally invalid |
 | `422` | `PAYEE_NOT_FOUND` | Resolver cannot verify the payee |
 | `422` | `SAME_PAYER_AND_PAYEE` | Self-payment is rejected |
-| `422` | `INVALID_AMOUNT` | Amount is not positive |
-| `403` | `PAYMENT_AUTHORIZATION_FAILED` | Simulated authorisation is rejected |
-| `503` | `GATEWAY_UNAVAILABLE` | Gateway definitely did not accept submission |
+| `422` | `INVALID_AMOUNT` | Amount is not positive or currency is not INR |
 
-An uncertain external outcome produces a `PENDING` payment, not a `503` response.
-
-## Persistence design
+## Persistence
 
 ### payments
 
-The table stores the aggregate state. Important constraints:
+Important constraints:
 
 - primary key on `id`;
 - unique `idempotency_key`;
 - positive `amount_minor`;
 - currency restricted to `INR`;
-- status restricted to the defined lifecycle;
+- status restricted to approved lifecycle values;
 - non-negative `version`.
 
 ### payment_status_changes
-
-Append-only transition history with:
 
 - primary key on `id`;
 - foreign key to `payments.id`;
 - index on `(payment_id, created_at)`.
 
-## Transaction boundaries
+The code uses one short-lived SQLite connection per repository operation. Development data is written to `data/upi_payments.db`, which is ignored by Git.
 
-### Creation
+## Responsibility boundaries
 
-1. Resolve the payee outside the database transaction.
-2. Insert `Payment` and its initial status record atomically.
-3. Use the unique idempotency constraint to resolve concurrent creation.
+```text
+HTTP request
+    → FastAPI schema and error mapping
+    → PaymentService orchestration
+    → VPA, Money and IdempotencyKey rules
+    → VpaResolver boundary
+    → SqlitePaymentRepository
+    → SQLite constraints and transaction
+```
 
-### Submission
+- **API:** transport fields, HTTP statuses and error responses.
+- **Service:** creation order, replay handling and dependency coordination.
+- **Domain:** valid values and payment request equality.
+- **Resolver:** external payee lookup boundary.
+- **Repository:** SQL mapping, atomic insert and concurrent idempotency protection.
+- **Database:** final relational constraints.
 
-1. Atomically move `CREATED → PROCESSING` and append history.
-2. Commit before calling the gateway.
-3. Submit with `transaction_reference = payment_id`.
-4. Atomically apply the gateway result and append history.
+## Setup
 
-### Crash recovery
+From the repository root in GitHub Codespaces:
 
-- Query the gateway using `payment_id`.
-- If it returns an existing result, apply that result locally.
-- If a `PROCESSING` payment is not found, safely resubmit with the same reference.
-- For `PENDING`, perform status enquiry only.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[test]'
+```
 
-### Concurrent updates
+## Run
 
-Each state change checks the current state and version. The payment update and history insertion succeed or fail in one local transaction.
+```bash
+uvicorn upi_payment.main:app --reload
+```
 
-## Core invariants
+Create a UUIDv7 in another terminal:
 
-1. Payment identity, parties, amount and currency are immutable after creation.
-2. One client idempotency key identifies one creation request.
-3. One payment causes at most one effective gateway transfer.
-4. A timeout never becomes `FAILED` without a definitive outcome.
-5. Only defined state transitions are accepted.
-6. Terminal states cannot change.
-7. The raw UPI PIN never enters APIs, persistence or logs.
-8. Every accepted state transition is traceable.
-9. A local transaction cannot atomically include the external gateway.
+```bash
+python -c "from uuid6 import uuid7; print(uuid7())"
+```
 
-## Exclusions
+Use the printed value:
 
-- QR-code initiation
-- P2M merchant payments
-- Collect requests
-- AutoPay and mandates
-- Refunds, reversals, disputes and chargebacks
-- Merchant settlement
-- Device binding, SIM verification and UPI registration
-- Real NPCI, PSP or bank connectivity
-- Production-scale distributed infrastructure
+```bash
+curl -i -X POST http://127.0.0.1:8000/v1/payments \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: <paste-uuidv7-here>' \
+  -d '{
+    "payerVpa": "alice@bank",
+    "payeeVpa": "bob@bank",
+    "amountMinor": 50000,
+    "currency": "INR",
+    "note": "Dinner"
+  }'
+```
+
+Repeat the same command with the same key to receive the original payment with `200 OK`.
+
+## Test
+
+Focused examples:
+
+```bash
+python -m pytest tests/test_domain.py
+python -m pytest tests/test_repository.py
+python -m pytest tests/test_service.py
+python -m pytest tests/test_api.py
+```
+
+Full suite:
+
+```bash
+python -m pytest
+```
+
+Phase 3 result:
+
+```text
+17 passed
+```
+
+## Project structure
+
+```text
+.
+├── PLAN.md
+├── README.md
+├── pyproject.toml
+├── src/
+│   └── upi_payment/
+│       ├── api.py
+│       ├── database.py
+│       ├── domain.py
+│       ├── errors.py
+│       ├── main.py
+│       ├── ports.py
+│       ├── repository.py
+│       ├── resolver.py
+│       └── service.py
+└── tests/
+    ├── conftest.py
+    ├── test_api.py
+    ├── test_domain.py
+    ├── test_repository.py
+    └── test_service.py
+```
+
+## Phase 4
+
+The next phase will implement:
+
+- simulated authorisation;
+- idempotent gateway submission using `payment_id`;
+- `PROCESSING`, `PENDING`, `SUCCEEDED` and `FAILED` transitions;
+- payment retrieval;
+- status refresh and crash recovery;
+- optimistic concurrency checks.
 
 ## Practical future scope
 
@@ -272,13 +322,6 @@ Each state change checks the current state and version. The payment update and h
 - Refund, reversal and dispute workflows.
 - Richer outcomes such as payer debited but payee not credited.
 - PostgreSQL concurrency and production-level high-level architecture.
-
-## Planned stack
-
-- Python
-- FastAPI
-- SQLite initially
-- Domain, repository, service, API and full-flow tests
 
 ## References
 
