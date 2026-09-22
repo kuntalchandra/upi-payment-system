@@ -4,7 +4,7 @@ A phased Python and FastAPI reference implementation for studying a basic UPI pa
 
 ## Current status
 
-Phase 4 is complete. The repository implements the complete basic P2P lifecycle: idempotent creation, retrieval, simulated authorisation, idempotent gateway submission, definitive and pending outcomes, status refresh, crash recovery, transition history and concurrent-update protection.
+The planned five phases are complete. The repository implements the complete basic P2P lifecycle: idempotent creation, retrieval, simulated authorisation, idempotent gateway submission, definitive and pending outcomes, status refresh, crash recovery, transition history and concurrent-update protection.
 
 ## System boundary
 
@@ -297,6 +297,22 @@ curl -i -X POST http://127.0.0.1:8000/v1/payments \
 
 Repeat the same command with the same key to receive the original payment with `200 OK`.
 
+Copy the `id` from the response and retrieve the payment:
+
+```bash
+curl -i http://127.0.0.1:8000/v1/payments/<payment-id>
+```
+
+Submit it using the approved simulation token:
+
+```bash
+curl -i -X POST http://127.0.0.1:8000/v1/payments/<payment-id>/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"authorizationToken":"test-approved-token"}'
+```
+
+The default gateway returns `SUCCEEDED`. Retrieve the payment again to see its terminal state and simulated network reference.
+
 ## Test
 
 Focused examples:
@@ -317,7 +333,7 @@ python -m pytest
 Current full-suite result:
 
 ```text
-32 passed
+33 passed
 ```
 
 ## Project structure
@@ -349,9 +365,22 @@ Current full-suite result:
     └── test_submission.py
 ```
 
-## Phase 5
+## Completion verification
 
-The final phase will remove any drift, exercise a clean setup and representative full flow, and verify requirements, API contracts, domain state, schema, code, tests, `PLAN.md` and `README.md` agree.
+- Fresh virtual environment installation completed successfully.
+- Ordinary test discovery passes 33 tests.
+- A live Uvicorn flow was verified over HTTP:
+
+  ```text
+  POST create  → 201 CREATED
+  GET payment  → 200 CREATED
+  POST submit  → 200 SUCCEEDED
+  GET payment  → 200 SUCCEEDED
+  ```
+
+- Requirements, API contracts, domain state, schema, services, repositories and tests use consistent terminology.
+- `PLAN.md` records every confirmed decision and all phases as complete.
+- This `README.md` documents the implemented system rather than deferred extensions.
 
 ## Practical future scope
 

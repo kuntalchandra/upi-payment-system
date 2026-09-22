@@ -47,25 +47,23 @@ Revisit only after the basic lifecycle is complete:
 - Richer operational outcomes such as payer debited but payee not credited.
 - PostgreSQL-based concurrency behaviour and production infrastructure.
 
-## 5. Confirmed lifecycle direction
+## 5. Confirmed lifecycle
 
 ```text
-Payment created
-    → authorised
-    → submitted
-        → succeeded
-        → failed
-        → outcome unresolved
-              → succeeded or failed after status enquiry
+CREATED
+    → PROCESSING
+        → SUCCEEDED
+        → FAILED
+        → PENDING
+              → SUCCEEDED
+              → FAILED
 ```
 
-Exact state names and allowed transitions will be finalised in Phase 1.
+`SUCCEEDED` and `FAILED` are terminal. Authorisation is a prerequisite for submission, not a persisted payment state.
 
-## 6. Initial invariants
+## 6. Confirmed invariants
 
-These will be reviewed and completed in Phase 1:
-
-1. Payment amount, payer and payee cannot change after submission.
+1. Payment amount, currency, payer and payee cannot change after creation.
 2. Repeating the same creation request must not create another logical payment.
 3. One logical payment must not cause multiple effective transfers.
 4. A timeout or missing response is not automatically a failed payment.
@@ -187,7 +185,7 @@ These will be reviewed and completed in Phase 1:
 | Phase 2 — Domain model, API and persistence design | Completed | Model, contracts, schema and transaction boundaries approved |
 | Phase 3 — Payment creation | Completed | Creation API and 17 tests passing |
 | Phase 4 — Submission and status resolution | Completed | Complete lifecycle and 32 tests passing |
-| Phase 5 — Consolidation and documentation | Not started |  |
+| Phase 5 — Consolidation and documentation | Completed | Clean setup, 33 tests and live HTTP flow verified |
 
 ## 12. Definition of done
 

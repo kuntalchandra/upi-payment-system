@@ -165,3 +165,20 @@ def test_concurrent_submission_calls_gateway_once(
         result.status in {PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED}
         for result in results
     )
+
+
+def test_gateway_is_idempotent_under_concurrent_direct_retries(
+    repository: SqlitePaymentRepository,
+) -> None:
+    gateway = InMemoryUpiGateway(GatewayOutcome.SUCCEEDED)
+    service = build_service(repository, gateway)
+    payment = create_payment(service)
+
+    def submit(_index: int):
+        return gateway.submit(payment.id, payment)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(submit, range(4)))
+
+    assert gateway.submission_count == 1
+    assert len(set(results)) == 1

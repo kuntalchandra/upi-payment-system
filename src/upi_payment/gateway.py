@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Lock
 from uuid import UUID
 
 from upi_payment.domain import Payment
@@ -12,27 +13,31 @@ class InMemoryUpiGateway:
     ) -> None:
         self._default_outcome = default_outcome
         self._results: dict[UUID, GatewayResult] = {}
+        self._lock = Lock()
         self.submission_count = 0
 
     def submit(
         self, transaction_reference: UUID, payment: Payment
     ) -> GatewayResult:
-        existing = self._results.get(transaction_reference)
-        if existing is not None:
-            return existing
+        with self._lock:
+            existing = self._results.get(transaction_reference)
+            if existing is not None:
+                return existing
 
-        self.submission_count += 1
-        result = self._new_result(transaction_reference)
-        self._results[transaction_reference] = result
-        return result
+            self.submission_count += 1
+            result = self._new_result(transaction_reference)
+            self._results[transaction_reference] = result
+            return result
 
     def get_status(self, transaction_reference: UUID) -> GatewayResult | None:
-        return self._results.get(transaction_reference)
+        with self._lock:
+            return self._results.get(transaction_reference)
 
     def set_result(
         self, transaction_reference: UUID, result: GatewayResult
     ) -> None:
-        self._results[transaction_reference] = result
+        with self._lock:
+            self._results[transaction_reference] = result
 
     def _new_result(self, transaction_reference: UUID) -> GatewayResult:
         reference = f"SIM-{transaction_reference}"
